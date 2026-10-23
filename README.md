@@ -5,7 +5,7 @@ A Python CLI agent that installs, configures, verifies, stops and removes **Apac
 ## Features (`agent/main.py`)
 
 - Interactive menu: **Install**, **Verify**, **Delete**, with a choice of **Local node** or **Cluster**
-- Downloads Hadoop 3.3.6 from `archive.apache.org` and extracts it with Python's safe `data` tar filter into `~/hadoopagent/installed/`
+- Downloads Hadoop 3.3.6 from `archive.apache.org` and extracts it with Python's safe `data` tar filter into `~/Downloads/hadoop/`
 - Generates the configuration files: `core-site.xml`, `hdfs-site.xml`, `mapred-site.xml`, `yarn-site.xml`, `workers`, and sets `JAVA_HOME` in `hadoop-env.sh` (detected from the `java` on PATH)
 - **Safe NameNode formatting**: formats only a brand-new cluster and only after you type `FORMAT`; refuses if HDFS metadata is missing but storage is not empty
 - Starts HDFS and YARN (`start-dfs.sh`, `start-yarn.sh`)
@@ -50,7 +50,8 @@ After choosing an action, pick `1` for the local node or `2` for a cluster. Once
 | HDFS NameNode UI | `http://<master>:9870` |
 | YARN ResourceManager UI | `http://<master>:8088` |
 
-Hadoop is installed under `~/hadoopagent/installed/hadoop-3.3.6`, and HDFS data under `~/hadoopagent/installed/data`.
+Hadoop is installed under `~/Downloads/hadoop/hadoop-3.3.6`, and HDFS data under `~/Downloads/hadoop/data`.
+On cluster nodes the same layout is created under the home directory of the SSH user (`~/Downloads/hadoop`).
 
 ## Earlier pipeline (`agent/phases`, `agent/rules`, `agent/utils`)
 

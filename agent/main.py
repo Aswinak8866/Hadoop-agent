@@ -18,7 +18,7 @@ ARCHIVE = f"hadoop-{VERSION}.tar.gz"
 URL = f"https://archive.apache.org/dist/hadoop/common/hadoop-{VERSION}/{ARCHIVE}"
 
 HOME = Path.home()
-BASE = HOME / "hadoopagent" / "installed"
+BASE = HOME / "Downloads" / "hadoop"
 HADOOP = BASE / f"hadoop-{VERSION}"
 DATA = BASE / "data"
 NN = DATA / "namenode"
@@ -215,7 +215,7 @@ def delete_local():
     if HADOOP.exists():
         shutil.rmtree(HADOOP)
     if choice == "2" and DATA.exists():
-        if DATA.resolve() != (HOME / "hadoopagent" / "installed" / "data").resolve():
+        if DATA.resolve() != (BASE / "data").resolve():
             raise RuntimeError("Unexpected data path; refusing deletion.")
         shutil.rmtree(DATA)
     print("Delete operation completed.")
