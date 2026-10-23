@@ -1,126 +1,399 @@
-from rich.console import Console
-from rich.panel import Panel
 
-from agent.phases.phase2_prereqs       import run_phase2
-from agent.phases.phase3_ssh           import run_phase3
-from agent.phases.phase4_install       import run_phase4
-from agent.phases.phase5_master_config import run_phase5
-from agent.phases.phase6_worker_config import run_phase6
-from agent.phases.phase7_start         import run_phase7
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import time
+import shutil
+import socket
+import subprocess
+import urllib.request
+import tarfile
+import tempfile
+from pathlib import Path
+from xml.etree.ElementTree import Element, SubElement, ElementTree
 
-console = Console()
+VERSION = "3.3.6"
+ARCHIVE = f"hadoop-{VERSION}.tar.gz"
+URL = f"https://archive.apache.org/dist/hadoop/common/hadoop-{VERSION}/{ARCHIVE}"
 
-def collect_real_machines():
-    print()
-    master_ip   = input("  Enter Master Node IP address        : ").strip()
-    master_user = input("  Enter Master SSH username           : ").strip()
-    master_pass = input("  Enter Master SSH password           : ").strip()
-    print()
-    while True:
+HOME = Path.home()
+BASE = HOME / "hadoopagent" / "installed"
+HADOOP = BASE / f"hadoop-{VERSION}"
+DATA = BASE / "data"
+NN = DATA / "namenode"
+DN = DATA / "datanode"
+CACHE = HOME / ".hadoop-agent"
+TARBALL = CACHE / ARCHIVE
+
+PROCESSES = {
+    "NameNode": "org.apache.hadoop.hdfs.server.namenode.NameNode",
+    "DataNode": "org.apache.hadoop.hdfs.server.datanode.DataNode",
+    "ResourceManager": "org.apache.hadoop.yarn.server.resourcemanager.ResourceManager",
+    "NodeManager": "org.apache.hadoop.yarn.server.nodemanager.NodeManager",
+}
+
+
+def execute(cmd, timeout=180, check=True, capture=False):
+    return subprocess.run(
+        cmd, text=True, timeout=timeout, check=check, capture_output=capture
+    )
+
+
+def java_home():
+    java = shutil.which("java")
+    if not java:
+        raise RuntimeError("Java is not installed. Install Java first.")
+    return str(Path(java).resolve().parent.parent)
+
+
+def download():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    if TARBALL.exists() and TARBALL.stat().st_size > 1_000_000:
+        return
+    print("Downloading Hadoop...")
+    urllib.request.urlretrieve(URL, TARBALL)
+
+
+def install_software():
+    if (HADOOP / "bin" / "hadoop").exists():
+        print(f"Hadoop already installed: {HADOOP}")
+        return
+
+    if HADOOP.exists():
+        raise RuntimeError(
+            f"Invalid installation directory: {HADOOP}. Inspect it manually."
+        )
+
+    download()
+    BASE.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as temp:
+        # Hadoop's official archive contains legitimate symbolic links.
+        # Python's data filter safely restricts extraction when supported.
+        with tarfile.open(TARBALL, "r:gz") as tf:
+            if not hasattr(tarfile, "data_filter"):
+                raise RuntimeError(
+                    "Use Python 3.12+ for safe archive extraction."
+                )
+            tf.extractall(temp, filter="data")
+
+        extracted = Path(temp) / f"hadoop-{VERSION}"
+        if not (extracted / "bin" / "hadoop").exists():
+            raise RuntimeError("Downloaded archive is invalid.")
+
+        shutil.copytree(extracted, HADOOP)
+
+    print("Hadoop software installed.")
+
+
+def write_xml(path, properties):
+    root = Element("configuration")
+    for key, value in properties.items():
+        p = SubElement(root, "property")
+        SubElement(p, "name").text = key
+        SubElement(p, "value").text = str(value)
+    ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
+
+
+def configure(master, workers):
+    conf = HADOOP / "etc" / "hadoop"
+    conf.mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
+    NN.mkdir(parents=True, exist_ok=True)
+    DN.mkdir(parents=True, exist_ok=True)
+
+    write_xml(conf / "core-site.xml", {
+        "fs.defaultFS": f"hdfs://{master}:9000",
+        "hadoop.tmp.dir": str(DATA / "tmp"),
+    })
+    write_xml(conf / "hdfs-site.xml", {
+        "dfs.replication": str(max(1, len(workers))),
+        "dfs.namenode.name.dir": f"file://{NN}",
+        "dfs.datanode.data.dir": f"file://{DN}",
+        "dfs.namenode.http-address": f"{master}:9870",
+    })
+    write_xml(conf / "mapred-site.xml", {
+        "mapreduce.framework.name": "yarn",
+    })
+    write_xml(conf / "yarn-site.xml", {
+        "yarn.resourcemanager.hostname": master,
+        "yarn.resourcemanager.webapp.address": f"{master}:8088",
+        "yarn.nodemanager.aux-services": "mapreduce_shuffle",
+    })
+
+    (conf / "workers").write_text(
+        "".join(f"{host}\n" for host in workers)
+    )
+
+    envfile = conf / "hadoop-env.sh"
+    lines = envfile.read_text().splitlines() if envfile.exists() else []
+    lines = [x for x in lines if not x.strip().startswith("export JAVA_HOME=")]
+    lines.append(f'export JAVA_HOME="{java_home()}"')
+    envfile.write_text("\n".join(lines) + "\n")
+
+    (DATA / "tmp").mkdir(parents=True, exist_ok=True)
+    print(f"Configuration written. Master: {master}")
+
+
+def run_hadoop(*args, timeout=120):
+    return execute([str(HADOOP / "bin" / "hadoop"), *args], timeout=timeout)
+
+
+def start_services(master, workers):
+    # Format only a brand-new NameNode with empty storage.
+    if not (NN / "current" / "VERSION").exists():
+        nn_files = list(NN.iterdir())
+        dn_files = list(DN.iterdir())
+        if nn_files or dn_files:
+            raise RuntimeError(
+                "HDFS metadata is missing but storage is not empty. "
+                "Refusing to format."
+            )
+        if input("New HDFS cluster. Type FORMAT to format NameNode: ") != "FORMAT":
+            raise RuntimeError("Formatting cancelled.")
+        run_hadoop("namenode", "-format", "-nonInteractive", timeout=180)
+
+    # The cluster must have passwordless SSH among configured worker nodes
+    # for Hadoop's start/stop scripts to work.
+    execute([str(HADOOP / "sbin" / "start-dfs.sh")], timeout=180)
+    time.sleep(5)
+    execute([str(HADOOP / "sbin" / "start-yarn.sh")], timeout=180)
+    time.sleep(5)
+    print("Service start commands completed.")
+    verify_local()
+
+
+def verify_local():
+    result = execute(["jps", "-l"], capture=True, check=False)
+    output = result.stdout or ""
+    print("\nJava processes:")
+    print(output.strip() or "No Java processes found.")
+
+    for name, class_name in PROCESSES.items():
+        state = "RUNNING" if class_name in output else "NOT RUNNING"
+        print(f"{name}: {state}")
+
+    print("\nLocal web port status:")
+    for port in (9870, 8088):
+        with socket.socket() as s:
+            s.settimeout(1)
+            status = "OPEN" if s.connect_ex(("127.0.0.1", port)) == 0 else "CLOSED"
+        print(f"Port {port}: {status}")
+
+
+def stop_local():
+    execute([str(HADOOP / "sbin" / "stop-yarn.sh")], check=False)
+    execute([str(HADOOP / "sbin" / "stop-dfs.sh")], check=False)
+    time.sleep(2)
+    verify_local()
+
+
+def delete_local():
+    print(f"Hadoop path: {HADOOP}")
+    print(f"HDFS data:   {DATA}")
+    print("1. Remove software only")
+    print("2. Remove software and HDFS data")
+    print("3. Cancel")
+    choice = input("Choose: ").strip()
+
+    if choice not in ("1", "2"):
+        print("Cancelled.")
+        return
+
+    if input("Type DELETE to confirm: ").strip() != "DELETE":
+        print("Cancelled.")
+        return
+
+    if (HADOOP / "sbin" / "stop-yarn.sh").exists():
+        stop_local()
+
+    output = execute(["jps", "-l"], capture=True, check=False).stdout or ""
+    if any(cls in output for cls in PROCESSES.values()):
+        raise RuntimeError("Hadoop processes remain; refusing deletion.")
+
+    if HADOOP.exists():
+        shutil.rmtree(HADOOP)
+    if choice == "2" and DATA.exists():
+        if DATA.resolve() != (HOME / "hadoopagent" / "installed" / "data").resolve():
+            raise RuntimeError("Unexpected data path; refusing deletion.")
+        shutil.rmtree(DATA)
+    print("Delete operation completed.")
+
+
+def valid_host(host):
+    # Accept IPv4 or a simple hostname; reject shell metacharacters.
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host))
+
+
+def ssh(host, username, *remote_command, timeout=30, check=True, capture=False):
+    if not valid_host(host) or not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
+        raise RuntimeError("Invalid hostname/IP or SSH username.")
+    return execute(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+         f"{username}@{host}", *remote_command],
+        timeout=timeout, check=check, capture=capture
+    )
+
+
+def remote_worker(host, username, action, master, workers):
+    target = f"{username}@{host}"
+    script = Path(__file__).resolve()
+    remote_script = "/tmp/hadoop_agent.py"
+
+    print(f"\nConnecting to {target}...")
+    ssh(host, username, "echo", "SSH_OK")
+
+    execute(["scp", str(script), f"{target}:{remote_script}"], timeout=60)
+
+    # Send cluster settings as ordinary command arguments.
+    args = [
+        "python3", remote_script, "--worker", action,
+        "--master", master, "--workers", ",".join(workers),
+    ]
+    ssh(host, username, *args, timeout=900)
+
+
+def cluster_operation(action):
+    try:
+        count = int(input("How many cluster nodes? ").strip())
+        if count < 1 or count > 20:
+            raise ValueError
+    except ValueError:
+        print("Enter a node count from 1 to 20.")
+        return
+
+    username = input("SSH username for all nodes: ").strip()
+    nodes = []
+    for i in range(count):
+        host = input(f"Node {i + 1} IP address/hostname: ").strip()
+        if not valid_host(host):
+            print(f"Invalid host: {host}")
+            return
+        if host in nodes:
+            print("Duplicate node. Enter each node only once.")
+            return
+        nodes.append(host)
+
+    master = nodes[0]
+    workers = nodes
+
+    # Verify SSH first, so unreachable nodes are reported before installation.
+    connected = []
+    for host in nodes:
         try:
-            worker_count = int(input("  How many Worker Nodes do you want?  : ").strip())
-            if worker_count > 0:
-                break
-            print("  Enter a number greater than 0.")
-        except ValueError:
-            print("  Invalid input.")
-    workers = []
-    for i in range(1, worker_count + 1):
-        print(f"\n  --- Worker Node {i} ---")
-        w_ip   = input(f"  Worker {i} IP address   : ").strip()
-        w_user = input(f"  Worker {i} SSH username : ").strip()
-        w_pass = input(f"  Worker {i} SSH password : ").strip()
-        workers.append({"id": i, "ip": w_ip, "username": w_user, "password": w_pass})
-    return {
-        "master": {"ip": master_ip, "username": master_user, "password": master_pass},
-        "workers": workers
-    }
+            ssh(host, username, "echo", "SSH_OK", timeout=15)
+            print(f"{host}: SSH CONNECTED")
+            connected.append(host)
+        except Exception as exc:
+            print(f"{host}: SSH FAILED — {exc}")
+
+    if len(connected) != len(nodes):
+        print("Operation cancelled: not all cluster nodes are reachable.")
+        return
+
+    # Install/configure each node, then start from the master.
+    for host in nodes:
+        remote_worker(host, username, "prepare" if action == "install" else action,
+                      master, workers)
+
+    if action == "install":
+        # Start the cluster scripts from the master node.
+        remote_worker(master, username, "start", master, workers)
+
+
+def worker(action, master, workers):
+    if action == "prepare":
+        install_software()
+        configure(master, workers)
+        run_hadoop("version")
+    elif action == "install":
+        install_software()
+        configure(master, workers)
+        start_services(master, workers)
+    elif action == "start":
+        start_services(master, workers)
+    elif action == "verify":
+        installed = (HADOOP / "bin" / "hadoop").exists()
+        print("Hadoop installed:", "YES" if installed else "NO")
+        if installed:
+            run_hadoop("version")
+            verify_local()
+    elif action == "stop":
+        if HADOOP.exists():
+            stop_local()
+        else:
+            print("Hadoop is not installed here.")
+    elif action == "delete":
+        if HADOOP.exists():
+            delete_local()
+        else:
+            print("Hadoop software is not installed here.")
+    elif action == "ports":
+        verify_local()
+
 
 def main():
-    console.print(Panel.fit(
-        "[bold white]HADOOP 3.4.2 CLUSTER INSTALLATION AGENT[/bold white]\n"
-        "[cyan]Ubuntu 22.04  |  Auto Rule Engine  |  Real Machines or Docker[/cyan]",
-        border_style="bold blue"
-    ))
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", choices=["prepare", "install", "start",
+                                              "verify", "stop", "delete", "ports"])
+    parser.add_argument("--master", default="localhost")
+    parser.add_argument("--workers", default="localhost")
+    args = parser.parse_args()
 
-    print()
-    console.print("[bold yellow]Choose your deployment type:[/bold yellow]")
-    console.print("  [bold cyan]1[/bold cyan] → I have real/separate machines or VMs (I will give IPs)")
-    console.print("  [bold cyan]2[/bold cyan] → I have only 1 machine (Agent auto-creates Docker containers)\n")
+    if args.worker:
+        try:
+            worker(args.worker, args.master, args.workers.split(","))
+        except Exception as exc:
+            print(f"FAILED: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     while True:
-        choice = input("  Enter your choice (1 or 2) : ").strip()
-        if choice in ["1", "2"]:
+        print("\n========================================")
+        print("             HADOOP AGENT")
+        print("========================================")
+        print("1. Install Hadoop")
+        print("2. Verify Hadoop")
+        print("3. Delete Hadoop")
+        print("4. Exit")
+        choice = input("Choose an option: ").strip()
+
+        if choice == "4":
+            print("Exiting.")
             break
-        print("  Please enter 1 or 2.")
+        if choice not in ("1", "2", "3"):
+            print("Invalid option.")
+            continue
 
-    if choice == "1":
-        console.print("\n[bold green]Mode: Real Machines[/bold green]\n")
-        cluster = collect_real_machines()
-    else:
-        console.print("\n[bold green]Mode: Docker Containers (Auto)[/bold green]\n")
-        from agent.phases.phase0_docker import run_phase0
-        cluster = run_phase0()
-        if not cluster:
-            console.print("[red]Docker setup failed.[/red]")
-            console.print("[yellow]Fix: sudo systemctl start docker[/yellow]")
-            return
+        action = {"1": "install", "2": "verify", "3": "delete"}[choice]
+        target = input("1. Local node  2. Cluster: ").strip()
 
-    # Show summary
-    print()
-    console.print(f"[bold cyan]Master   :[/bold cyan] {cluster['master']['ip']} ({cluster['master']['username']})")
-    for w in cluster["workers"]:
-        console.print(f"[bold cyan]Worker {w['id']}  :[/bold cyan] {w['ip']} ({w['username']})")
-    print()
+        try:
+            if target == "1":
+                if action == "install":
+                    install_software()
+                    configure("localhost", ["localhost"])
+                    run_hadoop("version")
+                    start_services("localhost", ["localhost"])
+                elif action == "verify":
+                    if not (HADOOP / "bin" / "hadoop").exists():
+                        print("Hadoop is NOT installed on this node.")
+                    else:
+                        run_hadoop("version")
+                        verify_local()
+                else:
+                    delete_local()
+            elif target == "2":
+                cluster_operation(action)
+            else:
+                print("Invalid target.")
+        except Exception as exc:
+            print(f"\nERROR: {exc}")
 
-    # Run all phases
-    if not run_phase2(cluster):
-        console.print("[red]Phase 2 failed.[/red]")
-        return
+        input("\nPress Enter to continue...")
 
-    if not run_phase3(cluster):
-        console.print("[red]Phase 3 failed.[/red]")
-        return
-
-    if not run_phase4(cluster):
-        console.print("[red]Phase 4 failed.[/red]")
-        return
-
-    if not run_phase5(cluster):
-        console.print("[red]Phase 5 failed.[/red]")
-        return
-
-    run_phase6(cluster)
-    run_phase7(cluster)
-
-    master_ip    = cluster["master"]["ip"]
-    worker_count = len(cluster["workers"])
-
-    if choice == "2":
-        hdfs_url  = "http://localhost:9870"
-        yarn_url  = "http://localhost:8088"
-        nodes_url = "http://localhost:8088/cluster/nodes"
-        worker_urls = "\n".join([
-            f"  Worker-{w['id']} UI → http://localhost:{w.get('nm_port', 8100 + w['id'])}"
-            for w in cluster["workers"]
-        ])
-    else:
-        hdfs_url  = f"http://{master_ip}:9870"
-        yarn_url  = f"http://{master_ip}:8088"
-        nodes_url = f"http://{master_ip}:8088/cluster/nodes"
-        worker_urls = ""
-
-    console.print(Panel.fit(
-        f"[bold green]✔  HADOOP 3.4.2 CLUSTER SETUP COMPLETE[/bold green]\n\n"
-        f"[white]Master  : {master_ip}[/white]\n"
-        f"[white]Workers : {worker_count} nodes[/white]\n\n"
-        f"[bold cyan]HDFS UI    → {hdfs_url}[/bold cyan]\n"
-        f"[bold cyan]YARN UI    → {yarn_url}[/bold cyan]\n"
-        f"[bold cyan]All Nodes  → {nodes_url}[/bold cyan]\n"
-        + (f"\n[cyan]{worker_urls}[/cyan]" if worker_urls else "") +
-        f"\n\n[yellow]YARN Active Nodes should show: {worker_count}[/yellow]",
-        border_style="green"
-    ))
 
 if __name__ == "__main__":
     main()

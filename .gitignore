@@ -1,0 +1,6 @@
+installed/
+__pycache__/
+*.pyc
+.env
+*.log
+agent/main.py.*
