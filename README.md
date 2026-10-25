@@ -18,8 +18,8 @@ In cluster mode the first node you enter is the master, and every node you enter
 ## Requirements
 
 - Linux (developed and run on an Ubuntu virtual machine)
-- Python 3.12+ (the safe archive extraction needs the `tarfile` data filter)
-- A JDK installed, with `java` on PATH
+- Python 3.8+ (developed and tested on 3.12)
+- A JDK (Java 8 or 11). If none is found, the agent installs OpenJDK 11 with apt
 - Internet access to download Hadoop
 - Cluster mode: `ssh` and `scp`, and passwordless (key-based) SSH between the nodes. Hadoop's own start scripts need it as well.
 
@@ -53,6 +53,24 @@ After choosing an action, pick `1` for the local node or `2` for a cluster. Once
 Hadoop is installed under `~/Downloads/hadoop/hadoop-3.3.6`, and HDFS data under `~/Downloads/hadoop/data`.
 On cluster nodes the same layout is created under the home directory of the SSH user (`~/Downloads/hadoop`).
 
+## Error handling (rule engine)
+
+`agent/hadoop_rules.py` is a pattern-based rule engine (no AI) for Hadoop 3.3.6. When a step fails, the error text is matched against 20 rules. The agent explains the cause, applies the known fix after confirmation (or automatically if you allow it) and retries. Errors that match no rule are printed unchanged.
+
+| Area | Errors handled |
+|---|---|
+| Java | JDK missing, JRE only (no `jps`), unsupported Java version, stale `HADOOP_HOME` |
+| apt | package index stale, dpkg lock held by automatic updates, sudo needs a password |
+| Download | network or DNS failure, corrupt or partial archive (SHA-512 checked, re-downloaded), disk full |
+| SSH | sshd not installed, passwordless SSH missing, hostname not resolving, pdsh using rsh |
+| HDFS / YARN | NameNode not formatted, clusterID mismatch (asks you to type DELETE), port in use or daemon already running, out of memory, firewall blocking Hadoop ports, running as root |
+
+After starting, the agent reads the logs of any daemon that is not running, matches them against the rules and restarts it.
+
+### Cluster install
+
+The agent copies itself and the rule engine to every node and prepares all nodes in parallel. It then sets up passwordless SSH from the master, starts HDFS and YARN, and checks `hdfs dfsadmin -report` for the number of live DataNodes. Requirements: the same SSH username on all nodes, and key-based SSH from the machine running the agent to every node.
+
 ## Earlier pipeline (`agent/phases`, `agent/rules`, `agent/utils`)
 
 An earlier, multi-phase implementation is kept in the repo for reference. It is **not called** by the current `main.py`.
@@ -76,6 +94,7 @@ Hadoop-agent/
 ├── requirements.txt
 └── agent/
     ├── main.py              # current agent (Hadoop 3.3.6)
+    ├── hadoop_rules.py      # rule engine used by main.py
     ├── phases/              # earlier pipeline (phase0 - phase7)
     ├── rules/rule_engine.py
     └── utils/               # logger.py, ssh_client.py
